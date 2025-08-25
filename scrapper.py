@@ -1,8 +1,4 @@
-import threading
-import time
-import random
-import json
-import traceback
+import threading, time, random, traceback, os
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -17,519 +13,486 @@ from selenium.common.exceptions import NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 
 # -----------------------------
-# Utility helpers
+# Helpers
 # -----------------------------
 
-def sleep_jitter(a=0.6, b=1.2):
+def j(a=0.6, b=1.2):
     time.sleep(random.uniform(a, b))
 
 
-def type_like_human(el, text: str, min_delay=0.05, max_delay=0.18):
+def human_type(el, text, a=0.05, b=0.18):
     for ch in text:
         el.send_keys(ch)
-        time.sleep(random.uniform(min_delay, max_delay))
+        j(a, b)
 
 
-def setup_driver(headless=False):
-    opts = webdriver.ChromeOptions()
+def driver_setup(headless=False):
+    o = webdriver.ChromeOptions()
     if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--start-maximized")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--lang=en-US,en")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.set_page_load_timeout(45)
-    return driver
-
+        o.add_argument("--headless=new")
+    for arg in [
+        "--disable-blink-features=AutomationControlled",
+        "--start-maximized",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--lang=en-US,en",
+    ]:
+        o.add_argument(arg)
+    d = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=o)
+    d.set_page_load_timeout(45)
+    return d
 
 # -----------------------------
-# LinkedIn scraping routines
+# Scraping
 # -----------------------------
 
-def linkedin_login(driver, email, password, log):
-    driver.get("https://www.linkedin.com/login")
-    sleep_jitter(1.0, 2.0)
-
-    user_el = driver.find_element(By.ID, "username")
-    pass_el = driver.find_element(By.ID, "password")
-    type_like_human(user_el, email)
-    sleep_jitter(0.2, 0.6)
-    type_like_human(pass_el, password)
-    sleep_jitter(0.2, 0.6)
-    driver.find_element(By.XPATH, "//button[@type='submit']").click()
-    sleep_jitter(2.0, 3.0)
-
-    if "feed" in driver.current_url or "checkpoint" not in driver.current_url:
-        log("✔️ Logged in (or navigated past login page)")
-    else:
-        log("⚠️ Login may have failed or needs verification (checkpoint)")
+def li_login(d, email, pwd, log):
+    d.get("https://www.linkedin.com/login"); j(1, 2)
+    human_type(d.find_element(By.ID, "username"), email); j(.2, .6)
+    human_type(d.find_element(By.ID, "password"), pwd); j(.2, .6)
+    d.find_element(By.XPATH, "//button[@type='submit']").click(); j(2, 3)
+    log(
+        "✔️ Logged in (or navigated past login page)"
+        if "checkpoint" not in d.current_url
+        else "⚠️ Login may need verification"
+    )
 
 
-def open_people_search(driver, keyword):
-    q = keyword.strip().replace(" ", "%20")
-    url = f"https://www.linkedin.com/search/results/people/?keywords={q}&origin=SWITCH_SEARCH_VERTICAL"
-    driver.get(url)
-    sleep_jitter(1.5, 2.5)
-    # Wait for list container to render
+def open_search(d, kw):
+    d.get(
+        f"https://www.linkedin.com/search/results/people/?keywords={kw.strip().replace(' ', '%20')}&origin=SWITCH_SEARCH_VERTICAL"
+    )
+    j(1.5, 2.5)
     try:
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//ul[contains(@class,'reusable-search__entity-result-list')]")))
+        WebDriverWait(d, 10).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//ul[contains(@class,'reusable-search__entity-result-list')]")
+            )
+        )
     except Exception:
         pass
 
 
-def scroll_results_page(driver, passes=2):
-    # Try scrolling the finite-scroll container; fallback to window
-    containers = driver.find_elements(By.CSS_SELECTOR, "div.scaffold-finite-scroll__content, div.search-results-container")
-    target = containers[0] if containers else None
+def scroll_results(d, passes=2):
+    cont = d.find_elements(
+        By.CSS_SELECTOR,
+        "div.scaffold-finite-scroll__content, div.search-results-container",
+    )
+    tgt = cont[0] if cont else None
     for _ in range(passes):
-        if target:
-            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", target)
+        if tgt:
+            d.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", tgt)
         else:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        sleep_jitter(1.0, 1.6)
+            d.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        j(1.0, 1.6)
 
 
-def extract_result_cards(driver):
-    # Wait for any recognizable search result pattern to appear
+def result_cards(d):
     patterns = [
         (By.XPATH, "//ul[contains(@class,'reusable-search__entity-result-list')]/li"),
         (By.CSS_SELECTOR, "li.reusable-search__result-container"),
         (By.CSS_SELECTOR, ".reusable-search__result-container"),
-        # Fallback: rows that have a Connect button
-        (By.XPATH, "//button[normalize-space()='Connect' or .//span[normalize-space()='Connect']]/ancestor::li"),
+        (
+            By.XPATH,
+            "//button[normalize-space()='Connect' or .//span[normalize-space()='Connect']]/ancestor::li",
+        ),
     ]
-
-    cards = []
     for by, sel in patterns:
         try:
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((by, sel)))
-            found = driver.find_elements(by, sel)
-            if found:
-                cards = found
-                break
+            WebDriverWait(d, 7).until(EC.presence_of_element_located((by, sel)))
+            got = d.find_elements(by, sel)
+            if got:
+                return got
         except Exception:
             continue
-
-    # As a last resort, grab any entity-result container
-    if not cards:
-        cards = driver.find_elements(By.XPATH, "//div[contains(@class,'entity-result')]/ancestor::li | //li[contains(@class,'entity-result__item')]")
-    return cards
-    # Last resort XPaths
-    cards = driver.find_elements(By.XPATH, "//li[contains(@class,'reusable-search__result-container') or contains(@class,'entity-result__item')]")
-    return cards
+    return d.find_elements(By.XPATH, "//li[contains(@class,'entity-result__item')]")
 
 
-def safe_get_text(el):
-    try:
-        return el.text.strip()
-    except Exception:
-        return ""
+def first_text(ctx, selectors):
+    for by, sel in selectors:
+        els = ctx.find_elements(by, sel)
+        if els:
+            return els[0].text.strip()
+    return ""
 
 
-def get_profile_link_from_card(card):
-    # Robustly grab any link pointing to /in/
-    # 1) direct /in/ links within the card
-    try:
-        a = card.find_element(By.XPATH, ".//a[contains(@href,'/in/')]")
-        href = a.get_attribute("href")
-        if href:
-            return href.split("?")[0]
-    except NoSuchElementException:
-        pass
-    # 2) app-aware-link fallback
-    try:
-        a = card.find_element(By.CSS_SELECTOR, "a.app-aware-link")
-        href = a.get_attribute("href")
-        if href and "/in/" in href:
-            return href.split("?")[0]
-    except NoSuchElementException:
-        pass
-    return None
-    return None
-
-
-def extract_profile_basic(driver):
-    data = {
-        "name": "",
-        "headline": "",
-        "location": "",
-        "about": "",
-        "current_company": "",
+def profile_basic(d):
+    return {
+        "name": first_text(
+            d,
+            [
+                (By.CSS_SELECTOR, "h1.text-heading-xlarge"),
+                (By.CSS_SELECTOR, "div.ph5.pb5 h1"),
+            ],
+        ),
+        "headline": first_text(
+            d,
+            [
+                (By.CSS_SELECTOR, "div.text-body-medium.break-words"),
+                (By.CSS_SELECTOR, "div.ph5.pb5 div.text-body-medium"),
+            ],
+        ),
+        "location": first_text(
+            d,
+            [
+                (
+                    By.XPATH,
+                    "//span[contains(@class,'text-body-small') and contains(@class,'inline')]",
+                ),
+            ],
+        ),
+        "about": first_text(
+            d,
+            [
+                (
+                    By.XPATH,
+                    "//section[contains(@id,'about') or .//h2[contains(.,'About')]]",
+                ),
+            ],
+        ),
     }
 
-    for sel in ["h1.text-heading-xlarge", "div.ph5.pb5 h1"]:
-        els = driver.find_elements(By.CSS_SELECTOR, sel)
-        if els:
-            data["name"] = safe_get_text(els[0])
-            break
 
-    for sel in ["div.text-body-medium.break-words", "div.ph5.pb5 div.text-body-medium"]:
-        els = driver.find_elements(By.CSS_SELECTOR, sel)
-        if els:
-            data["headline"] = safe_get_text(els[0])
-            break
-
-    try:
-        loc_el = driver.find_element(By.XPATH, "//span[contains(@class,'text-body-small') and contains(@class,'inline')]")
-        data["location"] = safe_get_text(loc_el)
-    except NoSuchElementException:
-        pass
-
-    try:
-        about_el = driver.find_element(By.XPATH, "//section[contains(@id,'about') or .//h2[contains(.,'About')]]")
-        data["about"] = safe_get_text(about_el)
-    except NoSuchElementException:
-        pass
-
-    return data
-
-
-def extract_experiences(driver, profile_url):
-    url = profile_url.rstrip('/') + "/details/experience/"
-    driver.get(url)
-    sleep_jitter(1.2, 1.8)
-
+def profile_exps(d, url):
+    d.get(url.rstrip("/") + "/details/experience/"); j(1.2, 1.8)
     exps = []
-    items = driver.find_elements(By.XPATH, "//li[@data-view-name='profile-component-entity' or @data-view-name='experience-item' or @role='listitem']")
-    if not items:
-        items = driver.find_elements(By.CSS_SELECTOR, "li")
-
+    items = d.find_elements(
+        By.XPATH,
+        "//li[@data-view-name='profile-component-entity' or @data-view-name='experience-item' or @role='listitem']",
+    )
+    items = items or d.find_elements(By.CSS_SELECTOR, "li")
     for li in items:
         try:
-            title = ""
-            company = ""
-            date_range = ""
-            location = ""
-            desc = ""
-
-            for sel in [".t-bold span[aria-hidden='true']", "span[aria-hidden='true']"]:
-                els = li.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    title = safe_get_text(els[0])
-                    break
-
+            title = first_text(
+                li,
+                [
+                    (By.CSS_SELECTOR, ".t-bold span[aria-hidden='true']"),
+                    (By.CSS_SELECTOR, "span[aria-hidden='true']"),
+                ],
+            )
+            company = first_text(
+                li,
+                [
+                    (
+                        By.XPATH,
+                        ".//span[contains(@class,'t-14') and contains(@class,'t-normal')]",
+                    )
+                ],
+            )
             try:
-                company_el = li.find_element(By.XPATH, ".//span[contains(@class,'t-14') and contains(@class,'t-normal')]")
-                company = safe_get_text(company_el)
+                date_range = (
+                    li.find_element(
+                        By.XPATH,
+                        ".//span[contains(@class,'t-14') and (contains(.,'Present') or contains(.,'–'))]",
+                    )
+                    .text.strip()
+                )
             except NoSuchElementException:
-                pass
-
+                date_range = ""
+            smalls = li.find_elements(
+                By.CSS_SELECTOR, "span.t-14.t-normal.t-black--light"
+            )
+            location = smalls[-1].text.strip() if len(smalls) >= 2 else ""
             try:
-                date_el = li.find_element(By.XPATH, ".//span[contains(@class,'t-14') and (contains(.,'Present') or contains(.,'–'))]")
-                date_range = safe_get_text(date_el)
+                desc = (
+                    li.find_element(
+                        By.XPATH, ".//div[contains(@class,'inline-show-more-text')]"
+                    )
+                    .text.strip()
+                )
             except NoSuchElementException:
-                pass
-
-            smalls = li.find_elements(By.CSS_SELECTOR, "span.t-14.t-normal.t-black--light")
-            if len(smalls) >= 2:
-                location = safe_get_text(smalls[-1])
-
-            try:
-                desc_el = li.find_element(By.XPATH, ".//div[contains(@class,'inline-show-more-text')]")
-                desc = safe_get_text(desc_el)
-            except NoSuchElementException:
-                pass
-
+                desc = ""
             if any([title, company, date_range, location, desc]):
-                exps.append({
-                    "title": title,
-                    "company": company,
-                    "date_range": date_range,
-                    "location": location,
-                    "description": desc,
-                })
+                exps.append(
+                    {
+                        "title": title,
+                        "company": company,
+                        "date_range": date_range,
+                        "location": location,
+                        "description": desc,
+                    }
+                )
         except Exception:
             continue
-
     return exps
 
 
-def scrape_people(driver, keyword, max_pages, log, stop_flag):
-    open_people_search(driver, keyword)
+def link_from_card(card):
+    try:
+        href = card.find_element(By.XPATH, ".//a[contains(@href,'/in/')]").get_attribute(
+            "href"
+        )
+        return href.split("?")[0] if href else None
+    except NoSuchElementException:
+        return None
 
-    results = []
-    page = 1
 
-    while not stop_flag[0]:
+def next_button(d):
+    xp = (
+        "//button[contains(@aria-label,'Next') and not(@disabled)] | "
+        "//span[normalize-space()='Next']/ancestor::button[not(@disabled)] | "
+        "//button[.//span[contains(normalize-space(.),'Next')] and not(@disabled)] | "
+        "//button[@aria-label='Berikutnya' and not(@disabled)] | "
+        "//span[normalize-space()='Berikutnya']/ancestor::button[not(@disabled)]"
+    )
+    try:
+        return d.find_element(By.XPATH, xp)
+    except NoSuchElementException:
+        return None
+
+
+def scrape(d, keyword, max_pages, log, stop, autosave=None):
+    open_search(d, keyword)
+    results, page = [], 1
+    while not stop[0]:
         log(f"🔎 Page {page}: scanning results…")
-
-        # Always make sure we are on the results page and it's populated
-        scroll_results_page(driver, passes=2)
-        cards = extract_result_cards(driver)
+        scroll_results(d, 2)
+        cards = result_cards(d)
         if not cards:
             log("⚠️ No cards found; rescrolling and retrying…")
-            scroll_results_page(driver, passes=3)
-            cards = extract_result_cards(driver)
+            scroll_results(d, 3)
+            cards = result_cards(d)
         log(f"• Found {len(cards)} result cards on this page")
 
-        # Snapshot the result page URL and the profile links NOW to avoid stale elements
-        results_url = driver.current_url
-        links = []
-        for card in cards:
-            link = get_profile_link_from_card(card)
-            if link and "/in/" in link:
-                links.append(link)
-
-        # Visit each profile in the SAME TAB then navigate back to the results page URL
-        for idx, link in enumerate(links, start=1):
-            if stop_flag[0]:
+        results_url = d.current_url
+        links = [l for l in (link_from_card(c) for c in cards) if l and "/in/" in l]
+        for i, link in enumerate(links, 1):
+            if stop[0]:
                 break
             try:
-                driver.get(link)
-                sleep_jitter(1.1, 1.7)
+                d.get(link); j(1.1, 1.7)
+                prof = profile_basic(d)
+                prof["profile_url"] = link
+                prof["experiences"] = profile_exps(d, link)
+                results.append(prof)
 
-                profile_basic = extract_profile_basic(driver)
-                exps = extract_experiences(driver, link)
-                profile_basic["profile_url"] = link
-                profile_basic["experiences"] = exps
-
-                results.append(profile_basic)
-                log(f"  ✔️ [{idx}/{len(links)}] {profile_basic.get('name') or 'Unknown'} — {link}")
-            except Exception as e:
-                log(f"  ⚠️ Error opening/extracting profile: {e}")
-            finally:
-                # Go back to the results page to continue/paginate
+                # AUTOSAVE setiap 3 profil
                 try:
-                    driver.get(results_url)
-                    sleep_jitter(0.8, 1.2)
+                    if autosave and len(results) % 3 == 0:
+                        autosave(results)
+                except Exception as _e:
+                    log(f"⚠️ Autosave failed: {_e}")
+
+                log(
+                    f"  ✔️ [{i}/{len(links)}] {prof.get('name') or 'Unknown'} — {link}"
+                )
+            except Exception as e:
+                log(f"  ⚠️ Error: {e}")
+                # AUTOSAVE saat error (mis. koneksi/driver)
+                try:
+                    if autosave:
+                        autosave(results)
+                except Exception as _e:
+                    log(f"⚠️ Autosave failed: {_e}")
+            finally:
+                try:
+                    d.get(results_url); j(.8, 1.2)
                 except Exception:
                     pass
 
-        # Pagination: click Next if exists
         if max_pages and page >= max_pages:
             log("⏹️ Reached max pages limit.")
             break
 
-        try:
-            # Try multiple patterns (English/Indonesian, span or aria-label)
-            next_xpath = (
-                "//button[contains(@aria-label,'Next') and not(@disabled)] | "
-                "//span[normalize-space()='Next']/ancestor::button[not(@disabled)] | "
-                "//button[.//span[contains(normalize-space(.),'Next')] and not(@disabled)] | "
-                "//button[@aria-label='Berikutnya' and not(@disabled)] | "
-                "//span[normalize-space()='Berikutnya']/ancestor::button[not(@disabled)]"
-            )
-            next_btn = driver.find_element(By.XPATH, next_xpath)
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", next_btn)
-            sleep_jitter(0.6, 1.0)
-            next_btn.click()
-            sleep_jitter(1.2, 1.8)
-            page += 1
-        except NoSuchElementException:
+        nxt = next_button(d)
+        if not nxt:
             log("✅ No more pages (Next button not found/disabled). Done.")
-            break
-        except Exception as e:
-            log(f"⚠️ Pagination error: {e}")
+            # autosave final snapshot juga boleh
+            try:
+                if autosave:
+                    autosave(results)
+            except Exception as _e:
+                log(f"⚠️ Autosave failed: {_e}")
             break
 
+        d.execute_script(
+            "arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", nxt
+        )
+        j(.6, 1.0); nxt.click(); j(1.2, 1.8); page += 1
     return results
 
 
-def format_experiences(exps):
-  lines = []
-  for e in exps or []:
-    parts = []
-    title = (e.get("title") or "").strip()
-    company = (e.get("company") or "").strip()
-    date_range = (e.get("date_range") or "").strip()
-    location = (e.get("location") or "").strip()
-    desc = (e.get("description") or "").strip()
-
-    if title:
-      parts.append(title)
-    if company:
-      parts.append(f"at {company}")
-
-    head = " ".join(parts).strip()
-    if date_range:
-      head += f" ({date_range})"
-    if location:
-      head += f" — {location}"
-    if desc:
-      head += f": {desc}"
-
-    if head:
-      lines.append(f"- {head}")
-
-  return "\n".join(lines)
+def fmt_exps(exps):
+    out = []
+    for e in exps or []:
+        t = (e.get("title") or "").strip(); c = (e.get("company") or "").strip()
+        dr = (e.get("date_range") or "").strip(); loc = (e.get("location") or "").strip(); desc = (e.get("description") or "").strip()
+        head = " ".join([x for x in [t, f"at {c}" if c else ""] if x]).strip()
+        if dr:
+            head += f" ({dr})"
+        if loc:
+            head += f" — {loc}"
+        if desc:
+            head += f": {desc}"
+        if head:
+            out.append("- " + head)
+    return "\n".join(out)
 
 
-def results_to_dataframe(results):
-    rows = []
-    for r in results:
-        rows.append({
+def to_df(results):
+    rows = [
+        {
             "Name": r.get("name", ""),
             "Headline": r.get("headline", ""),
             "Location": r.get("location", ""),
-            # Removed "Current Company" as requested
             "About": r.get("about", ""),
             "Profile URL": r.get("profile_url", ""),
-            "Experiences": format_experiences(r.get("experiences", [])),
-        })
-    # Column order
-    df = pd.DataFrame(rows, columns=["Name","Headline","Location","About","Profile URL","Experiences"])
-    return df
+            "Experiences": fmt_exps(r.get("experiences", [])),
+        }
+        for r in results
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["Name", "Headline", "Location", "About", "Profile URL", "Experiences"],
+    )
 
+
+def save_partial(results, out_path, fmt, log, tag="autosave"):
+    if not results:
+        return
+    base, ext = os.path.splitext(out_path)
+    if not ext:
+        ext = ".csv" if fmt == "csv" else ".xlsx"
+    path = f"{base}.{tag}{ext}"
+    df = to_df(results)
+    try:
+        if fmt == "csv":
+            df.to_csv(path, index=False)
+        else:
+            df.to_excel(path, index=False)
+        log(f"🧷 Autosaved partial results to {path} ({len(df)} rows)")
+    except Exception as e:
+        log(f"⚠️ Autosave failed to write: {e}")
 
 # -----------------------------
-# Tkinter UI
+# UI (Tkinter)
 # -----------------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LinkedIn People Scraper (Free UI - Tkinter)")
-        self.geometry("820x600")
+        self.title("LinkedIn People Scraper (Tkinter)"); self.geometry("820x600")
+        self.driver = None; self.worker = None; self.stop = [False]
+        self.build()
 
-        self.driver = None
-        self.worker = None
-        self.stop_flag = [False]
+    def build(self):
+        g = ttk.Frame(self); g.pack(fill=tk.X, padx=10, pady=10)
 
-        self.create_widgets()
+        def add(label, var, row, width=40, pw=False):
+            ttk.Label(g, text=label).grid(row=row, column=0, sticky=tk.W)
+            e = ttk.Entry(g, textvariable=var, width=width)
+            if pw:
+                e.config(show='*')
+            e.grid(row=row, column=1, sticky=tk.W)
 
-    def create_widgets(self):
-        frm = ttk.Frame(self)
-        frm.pack(fill=tk.X, padx=10, pady=10)
+        self.email = tk.StringVar(); add("LinkedIn Email", self.email, 0)
+        self.pwd = tk.StringVar(); add("Password", self.pwd, 1, pw=True)
+        self.kw = tk.StringVar(); add("Keyword", self.kw, 2)
+        self.pages = tk.StringVar(); ttk.Label(g, text="Max Pages (100 Max)").grid(row=3, column=0, sticky=tk.W); ttk.Entry(g, textvariable=self.pages, width=10).grid(row=3, column=1, sticky=tk.W)
+        self.headless = tk.BooleanVar(value=False); ttk.Checkbutton(g, text="Headless (hide browser)", variable=self.headless).grid(row=4, column=1, sticky=tk.W)
 
-        ttk.Label(frm, text="LinkedIn Email").grid(row=0, column=0, sticky=tk.W)
-        self.email_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.email_var, width=40).grid(row=0, column=1, sticky=tk.W)
+        s = ttk.Frame(self); s.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(s, text="Save as:").grid(row=0, column=0, sticky=tk.W)
+        self.fmt = tk.StringVar(value="csv")
+        ttk.Radiobutton(s, text="CSV", value="csv", variable=self.fmt).grid(row=0, column=1, sticky=tk.W)
+        ttk.Radiobutton(s, text="Excel", value="xlsx", variable=self.fmt).grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(s, text="Output file:").grid(row=1, column=0, sticky=tk.W)
+        self.out = tk.StringVar()
+        ttk.Entry(s, textvariable=self.out, width=50).grid(row=1, column=1, sticky=tk.W)
+        ttk.Button(s, text="Browse…", command=self.browse).grid(row=1, column=2, padx=5)
 
-        ttk.Label(frm, text="Password").grid(row=1, column=0, sticky=tk.W)
-        self.pwd_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.pwd_var, show="*", width=40).grid(row=1, column=1, sticky=tk.W)
+        b = ttk.Frame(self); b.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(b, text="Start", command=self.start).pack(side=tk.LEFT)
+        ttk.Button(b, text="Stop", command=self.stop_req).pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(frm, text="Keyword").grid(row=2, column=0, sticky=tk.W)
-        self.kw_var = tk.StringVar(value="Software Engineer Indonesia")
-        ttk.Entry(frm, textvariable=self.kw_var, width=40).grid(row=2, column=1, sticky=tk.W)
+        self.log = ScrolledText(self, height=20); self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=8); self.log.configure(state=tk.DISABLED)
+        for w in g.winfo_children(): w.grid_configure(padx=5, pady=5)
+        for w in s.winfo_children(): w.grid_configure(padx=5, pady=5)
 
-        ttk.Label(frm, text="Max Pages").grid(row=3, column=0, sticky=tk.W)
-        self.pages_var = tk.StringVar(value="3")
-        ttk.Entry(frm, textvariable=self.pages_var, width=10).grid(row=3, column=1, sticky=tk.W)
-
-        self.headless_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Headless (hide browser)", variable=self.headless_var).grid(row=4, column=1, sticky=tk.W)
-
-        # Save options
-        save_frm = ttk.Frame(self)
-        save_frm.pack(fill=tk.X, padx=10, pady=6)
-        ttk.Label(save_frm, text="Save as:").grid(row=0, column=0, sticky=tk.W)
-        self.fmt_var = tk.StringVar(value="csv")
-        ttk.Radiobutton(save_frm, text="CSV", value="csv", variable=self.fmt_var).grid(row=0, column=1, sticky=tk.W)
-        ttk.Radiobutton(save_frm, text="Excel", value="xlsx", variable=self.fmt_var).grid(row=0, column=2, sticky=tk.W)
-
-        ttk.Label(save_frm, text="Output file:").grid(row=1, column=0, sticky=tk.W)
-        self.out_var = tk.StringVar(value="linkedin_results.csv")
-        ttk.Entry(save_frm, textvariable=self.out_var, width=50).grid(row=1, column=1, sticky=tk.W)
-        ttk.Button(save_frm, text="Browse…", command=self.browse_save).grid(row=1, column=2, padx=5)
-
-        # Buttons
-        btn_frm = ttk.Frame(self)
-        btn_frm.pack(fill=tk.X, padx=10, pady=6)
-        ttk.Button(btn_frm, text="Start", command=self.on_start).pack(side=tk.LEFT)
-        ttk.Button(btn_frm, text="Stop", command=self.on_stop).pack(side=tk.LEFT, padx=8)
-
-        # Log area
-        self.log = ScrolledText(self, height=20)
-        self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
-        self.log.configure(state=tk.DISABLED)
-
-        # Style
-        for child in frm.winfo_children():
-            child.grid_configure(padx=5, pady=5)
-        for child in save_frm.winfo_children():
-            child.grid_configure(padx=5, pady=5)
-
-    def browse_save(self):
-        fmt = self.fmt_var.get()
-        defaultextension = ".csv" if fmt == "csv" else ".xlsx"
-        filetypes = [("CSV files", "*.csv")] if fmt == "csv" else [("Excel files", "*.xlsx")]
-        path = filedialog.asksaveasfilename(defaultextension=defaultextension, filetypes=filetypes)
+    def browse(self):
+        ft = [("CSV files", "*.csv")] if self.fmt.get() == "csv" else [("Excel files", "*.xlsx")]
+        path = filedialog.asksaveasfilename(
+            defaultextension=(".csv" if self.fmt.get() == "csv" else ".xlsx"),
+            filetypes=ft,
+        )
         if path:
-            self.out_var.set(path)
+            self.out.set(path)
 
-    def append_log(self, msg):
+    def log_add(self, msg):
         self.log.configure(state=tk.NORMAL)
         self.log.insert(tk.END, str(msg) + "\n")
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
         self.update_idletasks()
 
-    def on_start(self):
+    def start(self):
         if self.worker and self.worker.is_alive():
-            messagebox.showinfo("Info", "Scraping already running…")
-            return
-
-        email = self.email_var.get().strip()
-        pwd = self.pwd_var.get().strip()
-        kw = self.kw_var.get().strip()
+            return messagebox.showinfo("Info", "Scraping already running…")
+        if not all([self.email.get().strip(), self.pwd.get().strip(), self.kw.get().strip()]):
+            return messagebox.showerror("Missing", "Please fill Email, Password, and Keyword")
         try:
-            pages = int(self.pages_var.get().strip()) if self.pages_var.get().strip() else 1
+            pages = int(self.pages.get().strip() or 1)
         except ValueError:
             pages = 1
+        fmt, out = self.fmt.get(), self.out.get().strip() or (
+            "linkedin_results.csv" if self.fmt.get() == "csv" else "linkedin_results.xlsx"
+        )
+        if fmt == "csv" and not out.lower().endswith('.csv'):
+            out += '.csv'
+        if fmt == "xlsx" and not out.lower().endswith('.xlsx'):
+            out += '.xlsx'
+        self.stop[0] = False
 
-        if not email or not pwd or not kw:
-            messagebox.showerror("Missing", "Please fill Email, Password, and Keyword")
-            return
-
-        headless = self.headless_var.get()
-        fmt = self.fmt_var.get()
-        out_path = self.out_var.get().strip() or ("linkedin_results.csv" if fmt == "csv" else "linkedin_results.xlsx")
-
-        # Ensure extension matches chosen format
-        if fmt == "csv" and not out_path.lower().endswith('.csv'):
-            out_path += '.csv'
-        if fmt == "xlsx" and not out_path.lower().endswith('.xlsx'):
-            out_path += '.xlsx'
-
-        self.stop_flag[0] = False
-
-        def work(email_, pwd_, kw_, pages_, fmt_, headless_, out_path_):
-            driver = None
+        def work(email, pwd, kw, pages, fmt, headless, out):
+            d = None
+            res = []
             try:
-                self.append_log("Launching Chrome…")
-                driver = setup_driver(headless=headless_)
-                self.driver = driver
+                self.log_add("Launching Chrome…"); d = driver_setup(headless=headless); self.driver = d
+                self.log_add("Logging in to LinkedIn…"); li_login(d, email, pwd, self.log_add)
 
-                self.append_log("Logging in to LinkedIn…")
-                linkedin_login(driver, email_, pwd_, self.append_log)
+                def autosave_cb(r):
+                    try:
+                        save_partial(r, out, fmt, self.log_add)
+                    except Exception as _e:
+                        self.log_add(f"⚠️ Autosave failed: {_e}")
 
-                self.append_log(f"Searching people for: '{kw_}'")
-                results = scrape_people(driver, kw_, pages_, self.append_log, self.stop_flag)
-                self.append_log(f"Collected {len(results)} profiles.")
-
-                df = results_to_dataframe(results)
-                if fmt_ == "csv":
-                    df.to_csv(out_path_, index=False)
-                else:
-                    df.to_excel(out_path_, index=False)
-
-                self.append_log(f"✅ Saved results to {out_path_}")
-
+                self.log_add(f"Searching people for: '{kw}'")
+                res = scrape(d, kw, pages, self.log_add, self.stop, autosave=autosave_cb)
+                self.log_add(f"Collected {len(res)} profiles.")
+                df = to_df(res)
+                (df.to_csv(out, index=False) if fmt == "csv" else df.to_excel(out, index=False))
+                self.log_add(f"✅ Saved results to {out}")
             except Exception as e:
-                self.append_log("❌ Error: " + str(e))
-                self.append_log(traceback.format_exc())
+                self.log_add("❌ Error: " + str(e))
+                try:
+                    save_partial(res, out, fmt, self.log_add)
+                except Exception as _e:
+                    self.log_add(f"⚠️ Autosave failed: {_e}")
+                self.log_add(traceback.format_exc())
             finally:
                 try:
-                    if driver:
-                        driver.quit()
+                    d.quit()
                 except Exception:
                     pass
-                self.driver = None
-                self.append_log("Browser closed.")
+                self.driver = None; self.log_add("Browser closed.")
 
-        # pass values into the thread so there's no scope issue
-        self.worker = threading.Thread(target=work, args=(email, pwd, kw, pages, fmt, headless, out_path), daemon=True)
+        self.worker = threading.Thread(
+            target=work,
+            args=(
+                self.email.get().strip(),
+                self.pwd.get().strip(),
+                self.kw.get().strip(),
+                pages,
+                fmt,
+                self.headless.get(),
+                out,
+            ),
+            daemon=True,
+        )
         self.worker.start()
 
-    def on_stop(self):
-        self.stop_flag[0] = True
-        self.append_log("⏹️ Stop requested. Finishing current step…")
-
+    def stop_req(self):
+        self.stop[0] = True; self.log_add("⏹️ Stop requested. Finishing current step…")
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
