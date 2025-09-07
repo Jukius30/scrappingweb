@@ -91,6 +91,17 @@ def cleanup_overview_text(txt: str) -> str:
     )
     return txt.strip()
 
+def fmt_dur(sec: float) -> str:
+    if sec is None or sec == float("inf") or sec < 0:
+        return "—"
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
 # =========================
 # Auth & Search
 # =========================
@@ -114,15 +125,43 @@ def open_search(d, kw, mode):
     except Exception:
         pass
 
-def scroll_results(d, passes=2):
-    cont = d.find_elements(By.CSS_SELECTOR, "div.scaffold-finite-scroll__content, div.search-results-container")
-    tgt = cont[0] if cont else None
-    for _ in range(passes):
-        if tgt:
-            d.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", tgt)
-        else:
-            d.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        j(1.0, 1.6)
+def scroll_results(d, max_passes=30, min_wait=0.5, max_wait=1.1):
+    """
+    Robust scroll: utamakan document.scrollingElement (body/html),
+    lalu fallback ke container finite scroll bila ada.
+    """
+    last_h = -1
+    same_count = 0
+    for _ in range(max_passes):
+        try:
+            d.execute_script("""
+                const el = document.scrollingElement || document.documentElement || document.body;
+                el.scrollTo(0, el.scrollHeight);
+            """)
+            j(min_wait, max_wait)
+            new_h = d.execute_script("""
+                const el = document.scrollingElement || document.documentElement || document.body;
+                return el.scrollHeight;
+            """)
+            if new_h == last_h:
+                same_count += 1
+                if same_count >= 2:
+                    break
+            else:
+                same_count = 0
+                last_h = new_h
+        except Exception:
+            break
+
+    # Fallback ke container lama (jaga-jaga jika layout tertentu)
+    try:
+        conts = d.find_elements(By.CSS_SELECTOR, "div.scaffold-finite-scroll__content, div.search-results-container")
+        if conts:
+            for _ in range(6):
+                d.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", conts[0])
+                j(0.4, 0.8)
+    except Exception:
+        pass
 
 # =========================
 # Cards / Links
@@ -213,9 +252,70 @@ def next_button(d):
         "//span[normalize-space()='Berikutnya']/ancestor::button[not(@disabled)]"
     )
     try:
-        return d.find_element(By.XPATH, xp)
-    except NoSuchElementException:
+        WebDriverWait(d, 10).until(EC.presence_of_element_located((By.XPATH, xp)))
+        btns = d.find_elements(By.XPATH, xp)
+        return btns[0] if btns else None
+    except Exception:
         return None
+
+def click_next_page(d, mode, prev_first_href=None, timeout=15):
+    # Scroll paling bawah agar tombol Next terlihat
+    try:
+        d.execute_script("""
+            const el = document.scrollingElement || document.documentElement || document.body;
+            el.scrollTo(0, el.scrollHeight);
+        """)
+    except Exception:
+        pass
+    j(0.6, 1.0)
+
+    btn = next_button(d)
+    if not btn:
+        return False
+
+    try:
+        d.execute_script("arguments[0].scrollIntoView({behavior:'instant',block:'center'});", btn)
+        j(0.2, 0.5)
+        try:
+            btn.click()
+        except Exception:
+            d.execute_script("arguments[0].click();", btn)
+    except Exception:
+        return False
+
+    # Tunggu konfirmasi page berubah
+    start_url = d.current_url
+    end = time.time() + timeout
+    changed = False
+
+    while time.time() < end:
+        j(0.5, 0.9)
+        cur = d.current_url
+        if cur != start_url:
+            changed = True
+            break
+
+        # Fallback: cek perubahan first card href
+        try:
+            cards = result_cards(d, mode)
+            if cards:
+                a = None
+                try:
+                    a = cards[0].find_element(
+                        By.XPATH,
+                        ".//a[contains(@href,'/in/') or contains(@href,'/company/') or contains(@href,'/school/')]"
+                    )
+                except Exception:
+                    pass
+                if a:
+                    href = (a.get_attribute("href") or "").split("?", 1)[0]
+                    if prev_first_href and href and href != prev_first_href:
+                        changed = True
+                        break
+        except Exception:
+            pass
+
+    return changed
 
 # =========================
 # Profile parsers
@@ -330,30 +430,75 @@ def profile_basic_company(d):
     }
 
 # =========================
-# Scrape loop
+# Scrape loop (with ETA)
 # =========================
 
-def scrape(d, keyword, max_pages, log, stop, autosave=None, mode="people"):
+def scrape(d, keyword, max_pages, log, stop, autosave=None, mode="people", eta_cb=None):
     open_search(d, keyword, mode)
     results, page = [], 1
+
+    start_time = time.time()
+    pages_done = 0               # halaman selesai penuh
+    items_done_before = 0        # item selesai dari halaman2 sebelumnya
+    total_items_prev_pages = 0   # total item yang terdeteksi di halaman2 sebelumnya (untuk rata-rata)
+
+    def update_eta(processed_in_page, items_in_page, current_page_index):
+        """
+        processed_in_page: jumlah item yang sudah diproses di halaman saat ini (1..items_in_page)
+        items_in_page: total item di halaman saat ini (bisa 0)
+        current_page_index: nomor halaman saat ini (1-based)
+        """
+        if not eta_cb:
+            return
+        elapsed = time.time() - start_time
+        processed_total = items_done_before + processed_in_page
+        if processed_total <= 0 or elapsed <= 0:
+            eta_cb("ETA: —")
+            return
+
+        rate = processed_total / elapsed  # item/sec
+        # Rata2 item per halaman sejauh ini = (total_items_prev_pages + items_in_page) / (pages_done + 1)
+        avg_items_per_page_so_far = (
+            (total_items_prev_pages + max(items_in_page, 0)) / max(pages_done + 1, 1)
+        )
+
+        remaining_in_current = max(items_in_page - processed_in_page, 0)
+        remaining_pages = max((max_pages - current_page_index), 0) if max_pages else 0
+        est_remaining_items = remaining_in_current + avg_items_per_page_so_far * remaining_pages
+
+        eta_seconds = est_remaining_items / rate if rate > 0 else None
+        eta_cb(f"ETA: {fmt_dur(eta_seconds)}")
+
     while not stop[0]:
         log(f"🔎 Page {page}: scanning results…")
-        scroll_results(d, 2)
+        scroll_results(d, 12)
         cards = result_cards(d, mode)
         if not cards:
             log("⚠️ No cards found; rescrolling and retrying…")
-            scroll_results(d, 3); cards = result_cards(d, mode)
+            scroll_results(d, 10); cards = result_cards(d, mode)
         log(f"• Found {len(cards)} result cards on this page")
 
         results_url = d.current_url
+
+        # simpan href pertama untuk deteksi perubahan halaman
+        first_href_for_page = None
         items = []
         for c in cards:
             link = link_from_card(c, mode)
-            if not link: continue
-            if mode == "people" and "/in/" not in link: continue
-            if mode == "companies" and ("/company/" not in link and "/school/" not in link): continue
+            if not link:
+                continue
+            if mode == "people" and "/in/" not in link:
+                continue
+            if mode == "companies" and ("/company/" not in link and "/school/" not in link):
+                continue
             hint = (name_hint_from_card(c) if mode == "people" else company_hint_from_card(c))
             items.append((link, hint))
+            if first_href_for_page is None:
+                first_href_for_page = link
+
+        items_in_page = len(items)
+        if items_in_page == 0:
+            update_eta(0, 0, page)
 
         for i, (link, hint) in enumerate(items, 1):
             if stop[0]: break
@@ -381,7 +526,8 @@ def scrape(d, keyword, max_pages, log, stop, autosave=None, mode="people"):
                     log(f"⚠️ Autosave failed: {_e}")
 
                 label = prof.get('name') if mode == 'people' else prof.get('company_name')
-                log(f"  ✔️ [{i}/{len(items)}] {label or 'Unknown'} — {link}")
+                log(f"  ✔️ [{i}/{items_in_page}] {label or 'Unknown'} — {link}")
+
             except Exception as e:
                 log(f"  ⚠️ Error: {clean_err(e)}")
                 try:
@@ -390,24 +536,40 @@ def scrape(d, keyword, max_pages, log, stop, autosave=None, mode="people"):
                 except Exception as _e:
                     log(f"⚠️ Autosave failed: {_e}")
             finally:
+                # Update ETA setelah setiap item
+                update_eta(i, items_in_page, page)
                 try:
                     d.get(results_url); j(.8, 1.2)
                 except Exception:
                     pass
 
+        # halaman selesai: update akumulator untuk ETA
+        pages_done += 1
+        items_done_before += items_in_page
+        total_items_prev_pages += items_in_page
+
         if max_pages and page >= max_pages:
-            log("⏹️ Reached max pages limit."); break
-        nxt = next_button(d)
-        if not nxt:
-            log("✅ No more pages (Next button not found/disabled). Done.")
+            log("⏹️ Reached max pages limit.")
+            break
+
+        # klik Next; kalau gagal, anggap selesai
+        if not click_next_page(d, mode, prev_first_href=first_href_for_page, timeout=15):
+            log("✅ No more pages (Next not found/unclickable OR page didn't change). Done.")
             try:
                 if autosave:
                     autosave(results)
             except Exception as _e:
                 log(f"⚠️ Autosave failed: {_e}")
             break
-        d.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", nxt)
-        j(.6, 1.0); nxt.click(); j(1.2, 1.8); page += 1
+
+        # Setelah pindah halaman, trigger lazy load sedikit
+        j(1.0, 1.6)
+        scroll_results(d, 6)
+        page += 1
+
+    # Selesai: ETA jadi 0
+    if eta_cb:
+        eta_cb("ETA: 0s")
     return results
 
 # =========================
@@ -489,8 +651,8 @@ class App(tk.Tk):
 
         self.email = tk.StringVar(); add("LinkedIn Email", self.email, 0)
         self.pwd = tk.StringVar(); add("Password", self.pwd, 1, pw=True)
-        self.kw = tk.StringVar(value="Software Engineer Indonesia"); add("Keyword", self.kw, 2)
-        self.pages = tk.StringVar(value="3")
+        self.kw = tk.StringVar(value="Software Engineer Surabaya"); add("Keyword", self.kw, 2)
+        self.pages = tk.StringVar(value="2")
         ttk.Label(g, text="Max Pages").grid(row=3, column=0, sticky=tk.W)
         ttk.Entry(g, textvariable=self.pages, width=10).grid(row=3, column=1, sticky=tk.W)
         self.headless = tk.BooleanVar(value=False)
@@ -517,10 +679,18 @@ class App(tk.Tk):
         ttk.Button(b, text="Start", command=self.start).pack(side=tk.LEFT)
         ttk.Button(b, text="Stop", command=self.stop_req).pack(side=tk.LEFT, padx=8)
 
+        # === ETA label di sebelah kiri (real-time) ===
+        self.eta_var = tk.StringVar(value="ETA: —")
+        ttk.Label(b, textvariable=self.eta_var).pack(side=tk.LEFT, padx=16)
+
         self.log = ScrolledText(self, height=20)
         self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
         self.log.configure(state=tk.DISABLED)
         for w in g.winfo_children(): w.grid_configure(padx=5, pady=5)
+
+    def set_eta(self, text: str):
+        self.eta_var.set(text)
+        self.update_idletasks()
 
     def on_mode_change(self):
         cur = (self.out.get() or "").strip().lower()
@@ -560,6 +730,7 @@ class App(tk.Tk):
         if fmt == "csv" and not out.lower().endswith(".csv"): out += ".csv"
         if fmt == "xlsx" and not out.lower().endswith(".xlsx"): out += ".xlsx"
         self.stop[0] = False
+        self.set_eta("ETA: —")
 
         def work(email, pwd, kw, pages, fmt, headless, out, mode):
             d = None; res = []
@@ -576,7 +747,11 @@ class App(tk.Tk):
                         self.log_add(f"⚠️ Autosave failed: {_e}")
 
                 self.log_add(f"Searching {mode} for: '{kw}'")
-                res = scrape(d, kw, pages, self.log_add, self.stop, autosave=autosave_cb, mode=mode)
+                res = scrape(
+                    d, kw, pages, self.log_add, self.stop,
+                    autosave=autosave_cb, mode=mode,
+                    eta_cb=lambda text: self.set_eta(text)
+                )
                 self.log_add(f"Collected {len(res)} records.")
                 df = to_df_people(res) if mode == 'people' else to_df_companies(res)
                 (df.to_csv(out, index=False) if fmt == "csv" else df.to_excel(out, index=False))
@@ -593,6 +768,7 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 self.driver = None
+                self.set_eta("ETA: —")
                 self.log_add("Browser closed.")
 
         self.worker = threading.Thread(
