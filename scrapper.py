@@ -651,9 +651,9 @@ class App(tk.Tk):
 
         self.email = tk.StringVar(); add("LinkedIn Email", self.email, 0)
         self.pwd = tk.StringVar(); add("Password", self.pwd, 1, pw=True)
-        self.kw = tk.StringVar(value="Software Engineer Surabaya"); add("Keyword", self.kw, 2)
+        self.kw = tk.StringVar(); add("Keyword", self.kw, 2)
         self.pages = tk.StringVar(value="2")
-        ttk.Label(g, text="Max Pages").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(g, text="Max Pages (100 Max)").grid(row=3, column=0, sticky=tk.W)
         ttk.Entry(g, textvariable=self.pages, width=10).grid(row=3, column=1, sticky=tk.W)
         self.headless = tk.BooleanVar(value=False)
         ttk.Checkbutton(g, text="Headless (hide browser)", variable=self.headless).grid(row=4, column=1, sticky=tk.W)
@@ -671,7 +671,7 @@ class App(tk.Tk):
         ttk.Radiobutton(s, text="CSV", value="csv", variable=self.fmt).grid(row=0, column=1, sticky=tk.W)
         ttk.Radiobutton(s, text="Excel", value="xlsx", variable=self.fmt).grid(row=0, column=2, sticky=tk.W)
         ttk.Label(s, text="Output file:").grid(row=1, column=0, sticky=tk.W)
-        self.out = tk.StringVar(value="people_results.csv")
+        self.out = tk.StringVar(value="people_results")
         ttk.Entry(s, textvariable=self.out, width=56).grid(row=1, column=1, sticky=tk.W)
         ttk.Button(s, text="Browse…", command=self.browse).grid(row=1, column=2, padx=5)
 
@@ -694,9 +694,9 @@ class App(tk.Tk):
 
     def on_mode_change(self):
         cur = (self.out.get() or "").strip().lower()
-        defaults = {"people": "people_results.csv", "companies": "companies_results.csv"}
-        if (not cur) or cur.endswith(("linkedin_results.csv", "people_results.csv", "companies_results.csv")):
-            self.out.set(defaults.get(self.mode.get(), "results.csv"))
+        defaults = {"people": "people_results", "companies": "companies_results"}
+        if (not cur) or cur.endswith(("linkedin_results", "people_results", "companies_results")):
+            self.out.set(defaults.get(self.mode.get(), "results"))
 
     def browse(self):
         ft = [("CSV files", "*.csv")] if self.fmt.get() == "csv" else [("Excel files", "*.xlsx")]
@@ -725,7 +725,7 @@ class App(tk.Tk):
             pages = 1
 
         mode = self.mode.get()
-        default_name = "people_results.csv" if mode == 'people' else "companies_results.csv"
+        default_name = "people_results" if mode == 'people' else "companies_results"
         fmt, out = self.fmt.get(), self.out.get().strip() or default_name
         if fmt == "csv" and not out.lower().endswith(".csv"): out += ".csv"
         if fmt == "xlsx" and not out.lower().endswith(".xlsx"): out += ".xlsx"
